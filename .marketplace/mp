@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""mp — публикация проекта маркетплейса в git.
+
+Использование (из корня проекта):
+    python3 .marketplace/mp init               # привязать папку к репозиторию проекта
+    python3 .marketplace/mp push -m "сообщение" # закоммитить и запушить изменения
+    python3 .marketplace/mp status             # показать проект, репозиторий и состояние
+
+Откуда берётся адрес репозитория:
+  * если в .marketplace/project.json заполнен git.remote_url — используется он
+    (режим прототипа: доступ к git у пользователя уже настроен);
+  * иначе адрес запрашивается у API маркетплейса: GET {api_base}/projects/{id}/git,
+    а для push настраивается credential helper (.marketplace/git-credential-mp).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / ".marketplace" / "project.json"
+ENV_PATH = ROOT / ".env"
+HELPER_PATH = ROOT / ".marketplace" / "git-credential-mp"
+
+# Файлы, которые никогда не должны попадать в коммит
+FORBIDDEN_FILES = re.compile(r"(^|/)(\.env(\..*)?|id_rsa|id_ed25519|.*\.pem|.*\.key)$")
+# Похожие на секреты строки в добавляемых строках диффа
+SECRET_PATTERNS = [
+    ("токен маркетплейса", re.compile(r"mpk_[A-Za-z0-9_]{8,}")),
+    ("ключ Anthropic", re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}")),
+    ("ключ OpenAI", re.compile(r"sk-(proj-)?[A-Za-z0-9]{20,}")),
+    ("токен GitHub", re.compile(r"(ghp|gho|ghs|ghu)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}")),
+    ("приватный ключ", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+]
+
+
+class MpError(Exception):
+    pass
+
+
+def git(*args, check=True, capture=True):
+    res = subprocess.run(["git", *args], cwd=ROOT, text=True,
+                         stdout=subprocess.PIPE if capture else None,
+                         stderr=subprocess.PIPE if capture else None)
+    if check and res.returncode != 0:
+        msg = (res.stderr or res.stdout or "").strip()
+        raise MpError(f"git {' '.join(args)} завершился с ошибкой:\n{msg}")
+    return res
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise MpError(f"Не найден {CONFIG_PATH.relative_to(ROOT)}. Это папка проекта маркетплейса?")
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not cfg.get("project_id"):
+        raise MpError("В project.json не указан project_id.")
+    return cfg
+
+
+def load_token():
+    if os.environ.get("MP_TOKEN"):
+        return os.environ["MP_TOKEN"]
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("MP_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    raise MpError("Не найден MP_TOKEN (ни в окружении, ни в .env).")
+
+
+def api_get(cfg, path):
+    req = urllib.request.Request(f"{cfg['api_base'].rstrip('/')}{path}",
+                                 headers={"Authorization": f"Bearer {load_token()}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise MpError(f"API маркетплейса вернул {e.code} на {path}") from e
+    except urllib.error.URLError as e:
+        raise MpError(f"Нет связи с API маркетплейса: {e.reason}") from e
+
+
+def resolve_git(cfg):
+    """Возвращает (remote_url, branch, use_api_auth)."""
+    g = cfg.get("git") or {}
+    url = (g.get("remote_url") or "").strip()
+    if url:
+        if "<" in url or ">" in url:
+            raise MpError("В .marketplace/project.json замените git.remote_url на адрес вашего репозитория.")
+        return url, g.get("branch") or "main", False
+    if not cfg.get("api_base"):
+        raise MpError("В project.json нет ни git.remote_url, ни api_base.")
+    info = api_get(cfg, f"/projects/{cfg['project_id']}/git")
+    if info.get("status") != "ready":
+        raise MpError(f"Репозиторий проекта ещё не готов (status={info.get('status')}).")
+    return info["remote_url"], info.get("default_branch") or "main", True
+
+
+def ensure_gitignore():
+    gi = ROOT / ".gitignore"
+    lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    if ".env" not in [l.strip() for l in lines]:
+        gi.write_text("\n".join(lines + [".env"]) + "\n", encoding="utf-8")
+        print("В .gitignore добавлен .env")
+
+
+def has_commits():
+    return git("rev-parse", "--verify", "HEAD", check=False).returncode == 0
+
+
+def remote_branch_exists(branch):
+    return git("rev-parse", "--verify", f"refs/remotes/origin/{branch}", check=False).returncode == 0
+
+
+def web_url(remote_url):
+    m = re.match(r"(?:https://|git@)([^/:]+)[/:](.+?)(?:\.git)?/?$", remote_url)
+    return f"https://{m.group(1)}/{m.group(2)}" if m else None
+
+
+# ---------------------------------------------------------------- команды
+
+def cmd_init(_args):
+    cfg = load_config()
+    url, branch, use_api_auth = resolve_git(cfg)
+    ensure_gitignore()
+
+    if not (ROOT / ".git").exists():
+        git("init", "-b", branch)
+        print(f"Создан git-репозиторий (ветка {branch})")
+
+    if git("remote", "get-url", "origin", check=False).returncode == 0:
+        git("remote", "set-url", "origin", url)
+    else:
+        git("remote", "add", "origin", url)
+    print(f"origin → {url}")
+
+    user = cfg.get("user") or {}
+    for key in ("name", "email"):
+        if user.get(key):
+            git("config", "--local", f"user.{key}", user[key])
+    if user:
+        print(f"Автор коммитов: {user.get('name', '')} <{user.get('email', '')}>")
+
+    if use_api_auth:
+        git("config", "--local", "--replace-all", "credential.helper", "")
+        git("config", "--local", "--add", "credential.helper", f'!python3 "{HELPER_PATH}"')
+        git("config", "--local", "credential.useHttpPath", "true")
+        print("Настроен credential helper маркетплейса")
+
+    res = git("fetch", "origin", check=False)
+    if res.returncode != 0:
+        raise MpError("Не удалось получить данные из репозитория. Проверьте адрес и доступ:\n"
+                      + res.stderr.strip())
+
+    if remote_branch_exists(branch) and not has_commits():
+        # В репозитории уже есть код: его версия файлов главнее версии из архива,
+        # новые локальные файлы (которых нет в репозитории) сохраняются
+        git("reset", "-q", f"origin/{branch}")
+        git("checkout", "--", ".")
+        git("branch", f"--set-upstream-to=origin/{branch}")
+        print(f"Загружен код из репозитория (origin/{branch})")
+    print("Готово. Публикация: python3 .marketplace/mp push -m \"описание изменений\"")
+
+
+def check_secrets():
+    staged = git("diff", "--cached", "--name-only").stdout.split()
+    bad_files = [f for f in staged if FORBIDDEN_FILES.search(f)]
+    if bad_files:
+        raise MpError("В коммит попали файлы с секретами: " + ", ".join(bad_files)
+                      + "\nУберите их (git rm --cached <файл>) и добавьте в .gitignore.")
+    diff = git("diff", "--cached", "-U0", "--no-color").stdout
+    found, current = [], None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else line[4:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            for name, rx in SECRET_PATTERNS:
+                if rx.search(line):
+                    found.append(f"{current}: {name}")
+    if found:
+        raise MpError("Похоже, в изменениях есть секреты:\n  " + "\n  ".join(sorted(set(found)))
+                      + "\nПубликация остановлена. Уберите секреты из кода (используйте .env).")
+
+
+def cmd_push(args):
+    cfg = load_config()
+    if not (ROOT / ".git").exists() or git("remote", "get-url", "origin", check=False).returncode != 0:
+        raise MpError("Проект не привязан к репозиторию. Сначала выполните: python3 .marketplace/mp init")
+    _, branch, _ = resolve_git(cfg)
+    remote = git("remote", "get-url", "origin").stdout.strip()
+
+    git("add", "-A")
+    try:
+        check_secrets()
+    except MpError:
+        git("reset", "-q")  # снимаем индекс, файлы пользователя не трогаем
+        raise
+
+    if git("diff", "--cached", "--quiet", check=False).returncode != 0:
+        git("commit", "-m", args.message)
+        print("Создан коммит:", git("log", "-1", "--oneline").stdout.strip())
+    else:
+        print("Новых изменений для коммита нет.")
+
+    git("fetch", "origin", check=False)
+    if remote_branch_exists(branch):
+        res = git("pull", "--rebase", "origin", branch, check=False)
+        if res.returncode != 0:
+            git("rebase", "--abort", check=False)
+            raise MpError("Конфликт с изменениями в репозитории. Нужно разрешить конфликт вручную:\n"
+                          + (res.stderr or res.stdout).strip())
+        ahead = git("rev-list", "--count", f"origin/{branch}..HEAD").stdout.strip()
+        if ahead == "0":
+            print("Репозиторий уже в актуальном состоянии, пушить нечего.")
+            return
+
+    res = git("push", "-u", "origin", f"HEAD:{branch}", check=False)
+    if res.returncode != 0:
+        raise MpError("Push не удался:\n" + res.stderr.strip())
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    base = web_url(remote)
+    print(f"Опубликовано в {branch}: {sha[:7]}")
+    if base:
+        print(f"{base}/commit/{sha}")
+
+
+def cmd_status(_args):
+    cfg = load_config()
+    print(f"Проект:      {cfg.get('project_name', '')} ({cfg['project_id']})")
+    if not (ROOT / ".git").exists():
+        print("Git:         не инициализирован — выполните python3 .marketplace/mp init")
+        return
+    remote = git("remote", "get-url", "origin", check=False).stdout.strip() or "не задан"
+    print(f"Репозиторий: {remote}")
+    print(f"Ветка:       {git('branch', '--show-current').stdout.strip()}")
+    if has_commits():
+        print(f"Последний:   {git('log', '-1', '--format=%h %s (%cr)').stdout.strip()}")
+    changes = git("status", "--short").stdout.strip()
+    print("Изменения:   " + ("\n  " + changes.replace("\n", "\n  ") if changes else "нет"))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mp", description="Публикация проекта маркетплейса в git")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="привязать папку к репозиторию проекта")
+    pp = sub.add_parser("push", help="закоммитить и запушить изменения")
+    pp.add_argument("-m", "--message", required=True, help="описание изменений")
+    sub.add_parser("status", help="состояние проекта")
+    args = p.parse_args()
+    try:
+        {"init": cmd_init, "push": cmd_push, "status": cmd_status}[args.cmd](args)
+    except MpError as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

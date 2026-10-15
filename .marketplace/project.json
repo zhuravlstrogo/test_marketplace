@@ -1,0 +1,13 @@
+{
+  "project_id": "test001",
+  "project_name": "Тестовый проект",
+  "api_base": "https://marketplace.example/api",
+  "git": {
+    "remote_url": "git@github.com:zhuravlstrogo/test_marketplace.git",
+    "branch": "main"
+  },
+  "user": {
+    "name": "Alsu Iarulina",
+    "email": "al.yarulina@gmail.com"
+  }
+}
